@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>3D Packing Viewer</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #161d27;
+      --line: #2a3544;
+      --text: #e7eef7;
+      --muted: #8b9bb0;
+      --accent: #3d9cf0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.45 ui-sans-serif, system-ui, sans-serif; }
+    #app { display: flex; height: 100%; }
+    #sidebar {
+      width: 340px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
+      display: flex; flex-direction: column; min-height: 0;
+    }
+    #view { flex: 1; position: relative; min-width: 0; }
+    canvas { display: block; width: 100%; height: 100%; }
+    h1 { font-size: 15px; margin: 0; font-weight: 650; }
+    .pad { padding: 14px 14px 10px; border-bottom: 1px solid var(--line); }
+    .muted { color: var(--muted); }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin-top: 10px; }
+    .stat span { display: block; color: var(--muted); font-size: 11px; }
+    .stat b { font-size: 16px; font-variant-numeric: tabular-nums; }
+    label.ctrl { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; color: var(--muted); }
+    input[type=range] { width: 100%; }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    button {
+      background: #223044; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+      padding: 6px 10px; cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    select {
+      flex: 1; min-width: 0; background: #223044; color: var(--text);
+      border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+    }
+    #list { overflow: auto; flex: 1; padding: 6px 8px 12px; }
+    .item {
+      display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: center;
+      padding: 6px 8px; border-radius: 6px; cursor: pointer;
+    }
+    .item:hover, .item.on { background: #1e2836; }
+    .sw { width: 12px; height: 12px; border-radius: 3px; }
+    #hint {
+      position: absolute; left: 12px; bottom: 12px; color: var(--muted);
+      background: rgba(15,20,25,.72); padding: 6px 10px; border-radius: 6px; pointer-events: none;
+    }
+    .hist-caption { display: flex; justify-content: space-between; margin-top: 12px; color: var(--muted); font-size: 11px; }
+    .hist {
+      display: flex; align-items: flex-end; gap: 2px; height: 64px; margin-top: 6px;
+    }
+    .hcol {
+      flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column;
+      justify-content: flex-end; cursor: pointer;
+    }
+    .hbar { width: 100%; background: #3d9cf0; border-radius: 2px 2px 0 0; min-height: 1px; }
+    .hcol:hover .hbar { background: #7ec0f7; }
+    .hcol.on .hbar { background: #f0c14d; }
+    .hcol.empty .hbar { background: #2a3544; min-height: 1px; }
+    .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; margin-top: 4px; }
+    .bin-nav { display: flex; gap: 6px; margin-top: 10px; align-items: center; }
+    .bin-nav button { flex: none; padding: 6px 8px; }
+    .filter-note { margin-top: 6px; font-size: 11px; color: var(--accent); min-height: 16px; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="pad">
+        <h1>集装箱装填</h1>
+        <div class="muted">缓冲 12 · 传送带 10 · 装填率优先</div>
+        <div class="stats">
+          <div class="stat"><span>箱数</span><b id="s-bins">–</b></div>
+          <div class="stat"><span>装入 / 总数</span><b id="s-n">–</b></div>
+          <div class="stat"><span>平均装箱率</span><b id="s-mean">–</b></div>
+          <div class="stat"><span>中位数</span><b id="s-med">–</b></div>
+          <div class="stat"><span>最低 / 最高</span><b id="s-minmax">–</b></div>
+          <div class="stat"><span>箱体</span><b id="s-box">–</b></div>
+        </div>
+        <div class="hist-caption"><span>装箱率分布（5% 一档）</span><span id="hist-tip">点击筛箱</span></div>
+        <div class="hist" id="hist"></div>
+        <div class="axis"><span>0%</span><span>50%</span><span>100%</span></div>
+        <div class="filter-note" id="filter-note"></div>
+        <div class="bin-nav">
+          <button id="bin-prev" type="button">上一箱</button>
+          <select id="bin-sel"></select>
+          <button id="bin-next" type="button">下一箱</button>
+        </div>
+        <div class="stats">
+          <div class="stat"><span>本箱填充率</span><b id="s-fill">–</b></div>
+          <div class="stat"><span>本箱件数</span><b id="s-bn">–</b></div>
+          <div class="stat"><span>本箱体积</span><b id="s-vol">–</b></div>
+          <div class="stat"><span>带到下箱</span><b id="s-left">–</b></div>
+        </div>
+        <label class="ctrl"><span>透明度</span><span id="opv">85%</span></label>
+        <input id="opacity" type="range" min="25" max="100" value="85" />
+        <label class="ctrl"><span>爆炸展开</span><span id="exv">0</span></label>
+        <input id="explode" type="range" min="0" max="80" value="0" />
+        <div class="row">
+          <button id="reset" type="button">复位相机</button>
+          <button id="edges" type="button">线框</button>
+        </div>
+      </div>
+      <div id="list"></div>
+    </aside>
+    <div id="view">
+      <div id="hint">拖动旋转 · 滚轮缩放 · 右键平移 · 点击箱子高亮 · ← → 换箱</div>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script>
+    const DATA = __PACK_DATA__;
+    const bins = DATA.bins || [];
+    const boxVol = DATA.W * DATA.D * DATA.H;
+    const fills = bins.map(b => b.fill);
+    const packedCount = bins.reduce((s, b) => s + b.placed.length, 0);
+    const sorted = fills.slice().sort((a, b) => a - b);
+    const mean = fills.length ? fills.reduce((a, b) => a + b, 0) / fills.length : 0;
+    const median = fills.length
+      ? (fills.length % 2 ? sorted[(fills.length - 1) >> 1]
+        : 0.5 * (sorted[fills.length / 2 - 1] + sorted[fills.length / 2]))
+      : 0;
+    const minF = fills.length ? sorted[0] : 0;
+    const maxF = fills.length ? sorted[sorted.length - 1] : 0;
+
+    document.getElementById("s-bins").textContent = String(bins.length);
+    document.getElementById("s-n").textContent = packedCount + " / " + DATA.n;
+    document.getElementById("s-mean").textContent = mean.toFixed(2) + "%";
+    document.getElementById("s-med").textContent = median.toFixed(2) + "%";
+    document.getElementById("s-minmax").textContent = minF.toFixed(2) + "% / " + maxF.toFixed(2) + "%";
+    document.getElementById("s-box").textContent = DATA.W + "×" + DATA.D + "×" + DATA.H;
+
+    function fmt(n) {
+      if (n >= 1e8) return (n / 1e8).toFixed(2) + "e8";
+      return String(n);
+    }
+    function colorOf(id) {
+      const h = (id * 47) % 360;
+      return new THREE.Color(`hsl(${h}, 70%, 58%)`);
+    }
+    function bucketOf(fill) {
+      const b = Math.floor(fill / 5) * 5;
+      return Math.max(0, Math.min(95, b));
+    }
+
+    const histEl = document.getElementById("hist");
+    const counts = new Array(20).fill(0);
+    for (const f of fills) counts[bucketOf(f) / 5]++;
+    const maxC = Math.max(1, ...counts);
+    let filterLo = -1;
+    histEl.innerHTML = counts.map((c, i) => {
+      const lo = i * 5;
+      const h = Math.max(c ? 8 : 1, Math.round(56 * c / maxC));
+      return `<div class="hcol${c ? "" : " empty"}" data-lo="${lo}" title="[${lo},${lo + 5}${lo === 95 ? "]" : ")"}  ${c} 箱">
+        <div class="hbar" style="height:${h}px"></div></div>`;
+    }).join("");
+
+    function inFilter(i) {
+      if (filterLo < 0) return true;
+      const f = bins[i].fill;
+      if (filterLo === 95) return f >= 95;
+      return f >= filterLo && f < filterLo + 5;
+    }
+    function filteredIndex() {
+      const out = [];
+      for (let i = 0; i < bins.length; i++) if (inFilter(i)) out.push(i);
+      return out;
+    }
+    function rebuildSelect(keep) {
+      const sel = document.getElementById("bin-sel");
+      const idxs = filteredIndex();
+      sel.innerHTML = idxs.map(i => {
+        const b = bins[i];
+        return `<option value="${i}">箱 ${i + 1} · ${b.fill.toFixed(2)}% · ${b.placed.length}件</option>`;
+      }).join("");
+      const note = document.getElementById("filter-note");
+      if (filterLo < 0) note.textContent = "";
+      else {
+        const hi = filterLo === 95 ? "100]" : (filterLo + 5) + ")";
+        note.textContent = `筛选 [${filterLo},${hi} · ${idxs.length} 箱`;
+      }
+      if (!idxs.length) return -1;
+      const next = idxs.includes(keep) ? keep : idxs[0];
+      sel.value = String(next);
+      return next;
+    }
+
+    const view = document.getElementById("view");
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0f1419);
+    const camera = new THREE.PerspectiveCamera(50, 1, 1, 20000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    view.appendChild(renderer.domElement);
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.85);
+    sun.position.set(1.2, 2.0, 0.8);
+    scene.add(sun);
+
+    const cx = DATA.W / 2, cy = DATA.H / 2, cz = DATA.D / 2;
+    const container = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(DATA.W, DATA.H, DATA.D)),
+      new THREE.LineBasicMaterial({ color: 0x8aa0b8 })
+    );
+    container.position.set(cx, cy, cz);
+    scene.add(container);
+
+    const floor = new THREE.GridHelper(Math.max(DATA.W, DATA.D) * 1.4, 16, 0x2a3544, 0x1b2430);
+    floor.position.set(cx, 0, cz);
+    scene.add(floor);
+
+    const group = new THREE.Group();
+    scene.add(group);
+    let meshes = [];
+    const diag = Math.hypot(DATA.W, DATA.D, DATA.H);
+    camera.position.set(cx + diag * 0.85, cy + diag * 0.55, cz + diag * 0.85);
+    controls.target.set(cx, cy, cz);
+    controls.update();
+
+    const list = document.getElementById("list");
+    let showEdges = true, selected = -1, binIdx = 0;
+
+    function renderList(active) {
+      const placed = bins[binIdx] ? bins[binIdx].placed : [];
+      const rows = [];
+      for (const p of placed) {
+        const rgb = colorOf(p.id).getStyle();
+        rows.push(`<div class="item${active === p.id ? " on" : ""}" data-id="${p.id}">
+          <span class="sw" style="background:${rgb}"></span>
+          <span>#${p.id}　${p.w}×${p.d}×${p.h}</span>
+          <span class="muted">${p.x},${p.y},${p.z}</span></div>`);
+      }
+      list.innerHTML = rows.join("");
+    }
+
+    function applyOpacity(v) {
+      for (const m of meshes) m.material.opacity = v;
+    }
+    function applyExplode(t) {
+      const k = t / 100;
+      for (const m of meshes) {
+        const b = m.userData.base;
+        const dir = new THREE.Vector3(b.x - cx, b.y - cy, b.z - cz);
+        if (dir.lengthSq() < 1e-6) dir.set(0, 1, 0);
+        dir.normalize();
+        m.position.copy(b).addScaledVector(dir, k * diag * 0.22);
+      }
+    }
+    function highlight(id) {
+      selected = id;
+      const op = Number(document.getElementById("opacity").value) / 100;
+      for (const m of meshes) {
+        const on = m.userData.id === id || id < 0;
+        m.material.emissive = new THREE.Color(m.userData.id === id ? 0xffffff : 0x000000);
+        m.material.emissiveIntensity = m.userData.id === id ? 0.22 : 0;
+        m.material.opacity = on ? op : 0.12;
+      }
+      renderList(id);
+    }
+
+    function loadBin(i) {
+      if (i < 0 || i >= bins.length) return;
+      binIdx = i;
+      document.getElementById("bin-sel").value = String(i);
+      const b = bins[i];
+      document.getElementById("s-fill").textContent = b.fill.toFixed(2) + "%";
+      document.getElementById("s-bn").textContent = String(b.placed.length);
+      document.getElementById("s-vol").textContent = fmt(b.vol);
+      document.getElementById("s-left").textContent = String(b.left);
+      while (group.children.length) {
+        const ch = group.children[0];
+        group.remove(ch);
+        if (ch.geometry) ch.geometry.dispose();
+        if (ch.material) ch.material.dispose();
+      }
+      meshes = [];
+      const op = Number(document.getElementById("opacity").value) / 100;
+      for (const p of b.placed) {
+        const col = colorOf(p.id);
+        const mat = new THREE.MeshStandardMaterial({
+          color: col, transparent: true, opacity: op, roughness: 0.45, metalness: 0.08
+        });
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(p.w, p.h, p.d), mat);
+        mesh.userData = { id: p.id, base: new THREE.Vector3(p.x + p.w / 2, p.z + p.h / 2, p.y + p.d / 2), p };
+        mesh.position.copy(mesh.userData.base);
+        const edge = new THREE.LineSegments(
+          new THREE.EdgesGeometry(mesh.geometry),
+          new THREE.LineBasicMaterial({ color: 0x0b0f14, transparent: true, opacity: 0.55 })
+        );
+        edge.visible = showEdges;
+        mesh.add(edge);
+        group.add(mesh);
+        meshes.push(mesh);
+      }
+      selected = -1;
+      applyExplode(Number(document.getElementById("explode").value));
+      renderList(-1);
+    }
+
+    function stepBin(dir) {
+      const idxs = filteredIndex();
+      if (!idxs.length) return;
+      let p = idxs.indexOf(binIdx);
+      if (p < 0) p = 0;
+      p = (p + dir + idxs.length) % idxs.length;
+      loadBin(idxs[p]);
+    }
+
+    histEl.addEventListener("click", (e) => {
+      const col = e.target.closest(".hcol");
+      if (!col) return;
+      const lo = Number(col.dataset.lo);
+      filterLo = filterLo === lo ? -1 : lo;
+      for (const c of histEl.querySelectorAll(".hcol")) {
+        c.classList.toggle("on", filterLo >= 0 && Number(c.dataset.lo) === filterLo);
+      }
+      const next = rebuildSelect(binIdx);
+      if (next >= 0) loadBin(next);
+    });
+    document.getElementById("bin-sel").onchange = (e) => loadBin(Number(e.target.value));
+    document.getElementById("bin-prev").onclick = () => stepBin(-1);
+    document.getElementById("bin-next").onclick = () => stepBin(1);
+
+    document.getElementById("opacity").oninput = (e) => {
+      document.getElementById("opv").textContent = e.target.value + "%";
+      if (selected < 0) applyOpacity(Number(e.target.value) / 100);
+      else highlight(selected);
+    };
+    document.getElementById("explode").oninput = (e) => {
+      document.getElementById("exv").textContent = e.target.value;
+      applyExplode(Number(e.target.value));
+    };
+    document.getElementById("reset").onclick = () => {
+      camera.position.set(cx + diag * 0.85, cy + diag * 0.55, cz + diag * 0.85);
+      controls.target.set(cx, cy, cz);
+      document.getElementById("explode").value = 0;
+      document.getElementById("exv").textContent = "0";
+      applyExplode(0);
+      highlight(-1);
+      applyOpacity(Number(document.getElementById("opacity").value) / 100);
+    };
+    document.getElementById("edges").onclick = () => {
+      showEdges = !showEdges;
+      for (const m of meshes) m.children[0].visible = showEdges;
+    };
+    list.addEventListener("click", (e) => {
+      const it = e.target.closest(".item");
+      if (!it) return;
+      highlight(Number(it.dataset.id));
+    });
+    addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft") stepBin(-1);
+      if (e.key === "ArrowRight") stepBin(1);
+    });
+
+    const ray = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    renderer.domElement.addEventListener("pointerdown", (ev) => {
+      const r = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((ev.clientX - r.left) / r.width) * 2 - 1;
+      mouse.y = -((ev.clientY - r.top) / r.height) * 2 + 1;
+      ray.setFromCamera(mouse, camera);
+      const hit = ray.intersectObjects(meshes, false)[0];
+      highlight(hit ? hit.object.userData.id : -1);
+      if (!hit) applyOpacity(Number(document.getElementById("opacity").value) / 100);
+    });
+
+    function resize() {
+      const w = view.clientWidth, h = view.clientHeight;
+      camera.aspect = w / Math.max(h, 1);
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h, false);
+    }
+    addEventListener("resize", resize);
+    resize();
+
+    rebuildSelect(0);
+    if (bins.length) loadBin(0);
+
+    (function loop() {
+      requestAnimationFrame(loop);
+      controls.update();
+      renderer.render(scene, camera);
+    })();
+  </script>
+</body>
+</html>
