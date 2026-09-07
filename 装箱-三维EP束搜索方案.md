@@ -1,9 +1,9 @@
-# 三维装箱：生产窗口 + EP + 分层束搜索
+# 三维装箱：生产窗口 + EMS/EP + 分层束搜索
 
-实现：`pack3d.cpp`。几何用 **Extreme Point**，搜索用 **按已装件数分层的 beam**。  
+实现：`pack3d.cpp`。几何默认 **EMS 与 EP 同时维护**，Expand 时把两类落点取并；可用 `ems` / `ep` 只开一种。搜索用 **按已装件数分层的 beam**。  
 不是离线全局排列：一次最多看见缓冲里 12 件未装箱。流水线一次来一件；对当前窗口搜「再装 8 件」的最好状态并落实，再补槽。目标是装填率（已装体积），件数只作并列打破。
 
-不维护高度图，不用 EMS 当主状态，不跑可采纳 A\*。
+不维护高度图，不跑可采纳 A\*。
 
 ---
 
@@ -16,11 +16,13 @@
 | `input.txt` | 算例：`W D H` 后每行一件 `w d h` |
 | `快件高度 快件长度 快件宽度.txt` | 原始件尺寸（带表头） |
 
-编译与运行（必须带 `-fopenmp`；数字是线程数，默认 1）：
+编译与运行（必须带 `-fopenmp`；数字是线程数，默认 1；可选 `both` / `ems` / `ep`，默认两者都开）：
 
 ```
 g++ -O2 -std=c++17 -fopenmp -o pack3d pack3d.cpp
 ./pack3d 8 < input.txt > pack3d.out
+./pack3d 8 ep < input.txt > pack3d.out
+./pack3d 8 ems < input.txt > pack3d.out
 ```
 
 stdout：箱数 `N`，下一行各箱装填率（占 `W*D*H` 的百分比）。  
@@ -33,15 +35,16 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 ```
 容器:     W × D × H，原点在左-后-下
 件 i:     (w, d, h)，6 种轴对齐旋转
-状态 u:   (EPs, placed, g)
-          EPs     = 候选角点，空箱只有 (0,0,0)
-          placed  = 已装位姿（碰撞、支撑、投影）
+状态 u:   (eps, ems, placed, g)
+          eps     = Extreme Point 列表，空箱 (0,0,0)
+          ems     = 空最大长方体，空箱 = 整箱
+          placed  = 已装位姿（碰撞、支撑、更新几何）
           g       = 已装体积
 窗口:     g_open = 已到达、且未装进「上一箱」的件
           某状态的 pending = g_open \ 该状态已装
 ```
 
-下一件的左后下角只放在某个 EP 上。
+下一件的左后下角放在 **EMS 支承角 ∪ EP 点** 的去重并集上。同一落点只用 `residual_box` 打一次分，不把 EMS 盒尺寸和 EP 残腔混在一套 rank 里。
 
 ---
 
@@ -64,7 +67,7 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 ```
 
 比空箱还大的件直接跳过。其余不丢弃。  
-一箱墙钟 `TIME_LIMIT=55s`；超时后 `expand_state` 原样复制状态（看起来像「装不下」）。
+一箱墙钟 `TIME_LIMIT=90s`；超时后 `expand_state` 原样复制状态（看起来像「装不下」）。
 
 ---
 
@@ -79,19 +82,24 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 
 ---
 
-## 更新 EP
+## 更新几何
 
-件 `k` 放在 `(x,y,z)`，尺寸 `(w,d,h)`，放置原点永远是最小角：
+件 `k` 放在 `(x,y,z)`，尺寸 `(w,d,h)`，放置原点永远是最小角。
+
+**EMS（默认）**：空箱只有一块 `[0,W)×[0,D)×[0,H)`。与 `k` 相交的每个 EMS 用 Lai–Chan difference process 最多裂成 6 块（左/右/后/前/下/上，允许重叠）。丢掉零体积，丢掉被另一块完全包含的。超过 `MAXEMS=1280` 时按最短边、再按体积留最大的那些。
+
+落点不只钉左后下角：试该盒底面四个角（件贴齐后仍在盒内），以及底面 z 上已装件顶面与该盒的重叠角。极大空盒的最小角常常是悬空的（挡 `-z` 的货可能在底面另一侧）。件能放进去当且仅当三边都不超过该盒，再查支承。
+
+与 EP 同时开启时，这些角和 EP 点取并后，**残余一律从落点做 `residual_box`**，否则同一坐标会因「整块 EMS」和「局部残盒」两套尺子对不上。打分时，若姿态刚好把该残余填到箱盖，减掉一块与「典型件高度 × 底面积」同量级的分，避免贴合高柱顶死。
+
+**EP（`ep`）**：
 
 1. 丢掉落在 `k` 内部的旧点。
 2. 加入 `k` 在 +X / +Y / +Z 卦限的 6 个角。
 3. **Crainic**：把 `k` 的三个远顶点沿另外两轴投影到已装件的最近阻挡面（无阻挡则落到原点侧）。
-4. **反向 stamp**：每个已装件与 `k` 的 XY / YZ / XZ 重叠矩形，拷到 `k` 的 +Z / +X / +Y 面上（四个角）。  
-   经典 EP 只把**新件**投影到**旧件**上，悬挑后再塞短件时台面角不会出现；这一步补上，不针对某种布局写特例。
+4. **反向 stamp**：每个已装件与 `k` 的 XY / YZ / XZ 重叠矩形，拷到 `k` 的 +Z / +X / +Y 面上（四个角）。
 
-去重后若超过 `MAXEP=640`，在按 `(z,y,x)` 排序的列表上均匀抽样，高低角都留，不只留最低 z。
-
-空腔用 `residual_box`：以 EP 为最小角，沿 +x/+y/+z 长到墙或已装件。碰到障碍时，在还能切的轴上选留下体积最大的切法（最多 12 轮）。这是 `collect_placements` 里最贵的一步。
+去重后若超过 `MAXEP=640`，在按 `(z,y,x)` 排序的列表上均匀抽样。空腔用 `residual_box`：以 EP 为最小角，沿 +x/+y/+z 长到墙或已装件。
 
 巨大空腔：至少两条轴 ≥ 件的 2 倍，且残余体积 ≥ 5× 件体积。
 
@@ -99,16 +107,17 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 
 ## 分数（不要混用）
 
-**落点分** `place_score` —— 只比较同一件的不同 EP / 旋转：
+**落点分** `place_score` —— 只比较同一件的不同候选 / 旋转：
 
 ```
-巨大空腔:  vol + contact/3
-否则:      vol/10 − cavity_waste − 80·height_mismatch + contact/3
+巨大空腔:  vol + contact/3 − lid
+否则:      vol/10 − cavity_waste − 80·height_mismatch + contact/3 − lid
 ```
 
 - `contact`：与箱壁、已装件共面的接触面积
 - `cavity_waste`：残余盒体积 − 件体积
 - `height_mismatch`：与 xy 间隙 ≤ 40 的邻件比顶面高度差；没有邻居则 0
+- `lid`：姿态把当前残余高度恰好填到 `H` 时为 `3·w·d·max(typical_edge, 180)`，否则 0
 
 tight 模式另外丢掉巨大空腔，以及浪费 > 2× 件体积的姿态。  
 非 tight：只要存在非巨大姿态，就丢掉巨大姿态（小件不要去占给后面大件留的洞）。
@@ -120,12 +129,12 @@ rank = g·10000 − compactness·20 + cavity_tiebreak
 ```
 
 - `compactness`：各件最小角之和 + 包围盒底面积/8 + 最高 z + 3·|EPs|（同等体积偏好更挤向原点）
-- `cavity_tiebreak`：各 EP 上的残余盒。最短边 ≥ `g_typical_edge` 的算可用（奖最大洞 + 总和），否则算死缝（重罚）
+- `cavity_tiebreak`：开着 EMS 时用各空盒（不和 EP 残腔相加，量纲不同且 EMS 已重叠）。仅 EP 时用各点上的残余盒。最短边 ≥ `g_typical_edge` 的算可用
 
 **报优 / 装填率** `better_state`：先比 `g`，再比件数。
 
 **大件搁浅惩罚**（只加在 `select_top` 的前 `max(beam, 3·beam)` 个上）：  
-看 pending 里体积最大的 4 件，当前 EP 上已完全放不下的体积 × 20000 从 rank 里减掉。略空一点但还能放大件的布局，优于把大件卡死的贪心填满。
+看 pending 里体积最大的 4 件，当前候选上已完全放不下的体积 × 20000 从 rank 里减掉。略空一点但还能放大件的布局，优于把大件卡死的贪心填满。
 
 ---
 
@@ -147,8 +156,8 @@ buffer_round(cur, max_pending, tight_only):
 
 1. 按 `state_rank` 排序
 2. 对头部 pool 再减大件搁浅惩罚，重排
-3. `ep_sig` 去重（已装 id + 前几个 EP；不同放置顺序走到同一几何只留一份）
-4. 按 `|EPs|/6` 分桶，每桶约 `beam/8`，溢出按名次补满 `beam`
+3. `geom_sig` 去重（已装 id + 前几个空腔；不同放置顺序走到同一几何只留一份）
+4. 按 `|geom|/6` 分桶，每桶约 `beam/8`，溢出按名次补满 `beam`
 
 层与层、箱与箱串行（下一箱依赖剩件）。
 
@@ -159,8 +168,9 @@ buffer_round(cur, max_pending, tight_only):
 ```
 beam          480     每层活状态
 pos_keep      3       同一 (状态, SKU) 保留的姿态数
-TIME_LIMIT    55s     每箱墙钟
-MAXEP         640
+TIME_LIMIT    90s     每箱墙钟
+MAXEP         640     EP 点数上限
+MAXEMS        1280    EMS 空盒上限
 MAX_PLACED    256     单箱件数硬顶
 SUPPORT_RATIO 0.60
 BUFFER_CAP    12      未装件数上限
@@ -183,9 +193,9 @@ CHUNK_K       8       每轮从窗口搜这么多层，落实最好状态后再�
     ├─ 装成过 → 回到补槽
     └─ 本轮装不动（或流尽）→ 封箱，剩件进下一箱
             │
-            每层：pending SKU × 旋转 × EP
-                  Feasible → place_score 留 pos_keep
-                  UpdateEPs（含反向 stamp）
+            每层：pending SKU × 旋转 × (EMS角 ∪ EP)
+                  Feasible → residual_box → place_score 留 pos_keep
+                  UpdateEMS 且/或 UpdateEPs
                   state_rank + 大件惩罚 + 去重分桶
 ```
 

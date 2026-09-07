@@ -1,13 +1,14 @@
 /*
-  3D container packing — Extreme Points + layered beam search
+  3D container packing — EMS / EP + layered beam search
 
   ---------------------------------------------------------------------------
   What this program does
   ---------------------------------------------------------------------------
   Pack a stream of rectangular parcels into identical containers using a
   production schedule (not a global offline permutation of all items).
-  Geometry is Extreme Points (EP): the left-back-bottom corner of the next
-  item is only tried at current corner candidates. Search is a layered beam:
+  Default geometry uses both Empty Maximal Spaces (EMS) and Extreme Points
+  (EP): each expansion tries the union of EMS supported corners and EP
+  candidates. Pass `ems` or `ep` to use only one. Search is a layered beam:
   each layer places one more item, then keeps the best `beam` partial packs.
 
   Input (stdin):
@@ -21,9 +22,12 @@
 
   Also writes pack3d.html (template pack_viewer.html) with per-bin placements.
 
-  Build and run (OpenMP is required; argv is the thread count, default 1):
+  Build and run (OpenMP is required; first number is threads, default 1;
+  optional `both` / `ems` / `ep` selects geometry, default both):
     g++ -O2 -std=c++17 -fopenmp -o pack3d pack3d.cpp
     ./pack3d 8 < input.txt > pack3d.out
+    ./pack3d 8 ep < input.txt > pack3d.out
+    ./pack3d 8 ems < input.txt > pack3d.out
 
   ---------------------------------------------------------------------------
   Production window (not "see all remaining SKUs")
@@ -56,39 +60,45 @@
   it is in-bin, AABB-disjoint from packed items, bottom-face support >= 60%,
   and the bottom-face center lies on the floor or on another item's top.
 
-  After placing k, EPs are updated by:
-    - dropping points inside k
-    - adding k's six +X/+Y/+Z corners
-    - Crainic projections of k's vertices onto already packed items
-    - reverse: every packed item's XY/YZ/XZ overlap stamped onto k's three
-      positive faces (so a ledge packed *after* an overhang still gets EPs)
-  If more than MAXEP points remain, subsample across sorted (z,y,x) so both
-  floor and ceiling candidates survive (do not keep only the lowest z).
+  Combined (default): keep both lists on the state. Expand unions EMS
+  origins with EP points, then scores every distinct (x,y,z) with the same
+  residual_box (do not mix EMS-box size and EP residual — they are not
+  comparable). Lid penalty still applies.
+
+  EMS: empty box is one maximal AABB. After placing k, every EMS that
+  intersects k is split by the Lai–Chan difference process. Placement tries
+  four bottom corners plus packed-top overlaps on that floor.
+
+  EP: after placing k, points are updated by dropping interiors, adding k's
+  six +X/+Y/+Z corners, Crainic projections, and reverse stamp of packed
+  overlap onto k's three positive faces. If more than MAXEP points remain,
+  subsample across sorted (z,y,x).
 
   ---------------------------------------------------------------------------
   Scoring (fill-rate first; no count-first / order-online switch)
   ---------------------------------------------------------------------------
-  place_score (same item, different EP/rot):
-    huge cavity  ->  vol + contact/3
-    else         ->  vol/10 - cavity_waste - 80*height_mismatch + contact/3
-  Height matching uses nearby packed tops (xy-gap <= 40). Huge = at least two
-  residual axes >= 2x the item, and residual volume >= 5x item volume.
+  place_score (same item, different candidate/rot):
+    huge cavity  ->  vol + contact/3 - lid
+    else         ->  vol/10 - cavity_waste - 80*height_mismatch + contact/3 - lid
+  Residual is always residual_box from the origin (EP and EMS poses share
+  one scale). lid = 3*w*d*max(typical_edge,180) when the pose fills this
+  residual up to H.
 
   better_state / reported fill: packed volume, then item count.
   state_rank for beam: g*10000 - compactness*20 + cavity_tiebreak.
-  cavity_tiebreak uses residual boxes at EPs vs g_typical_edge (median min-edge
-  of items that have already arrived, at least 80): reward usable cavities,
-  penalize dead slivers. Top beam candidates also lose 20000 * volume of the
-  largest pending SKUs that no longer fit any EP (avoid stranding larges).
+  cavity_tiebreak uses leftover EMS / EP residuals vs g_typical_edge (median
+  min-edge of items that have already arrived, at least 80): reward usable
+  cavities, penalize dead slivers. Top beam candidates also lose 20000 *
+  volume of the largest pending SKUs that no longer fit (avoid stranding).
 
   ---------------------------------------------------------------------------
   Beam
   ---------------------------------------------------------------------------
   beam = 480 states per layer, pos_keep = 3 placements per (state, item).
-  TIME_LIMIT = 55s per container; after that expand_state copies the state
+  TIME_LIMIT = 90s per container; after that expand_state copies the state
   unchanged (looks like "cannot pack"). select_top: rank, penalize unplaceable
-  larges on the top pool, dedup similar EP signatures, bucket by nep so one
-  contour family cannot fill the whole beam.
+  larges on the top pool, dedup similar geometry signatures, bucket by cavity
+  count so one contour family cannot fill the whole beam.
 
   One buffer_round = try to place one more item on every live state, then
   keep top `beam`. Expanding those states is OpenMP-parallel; ranking too.
@@ -101,12 +111,15 @@ using namespace std;
 
 static const int MAX_PLACED = 256;   // hard cap of items in one container
 static const int MAXEP = 640;        // EP list cap; extras are z-strided, not lowest-z only
-static const double TIME_LIMIT = 55.0;  // wall seconds per container, then expand stops
+static const int MAXEMS = 1280;      // EMS list cap; extras keep largest usable boxes
+static const double TIME_LIMIT = 90.0;  // wall seconds per container, then expand stops
 static const double SUPPORT_RATIO = 0.60;
 static const int BUFFER_CAP = 12;    // max unpacked items
 static const int OPEN_CAP = BUFFER_CAP;
 static const int CHUNK_K = 8;        // beam-pack this many, commit best, refill
 int g_nthreads = 1;
+bool g_use_ems = true;               // default both; `ems` / `ep` select one
+bool g_use_ep = true;
 // 6 distinct axis-aligned orientations of (w,d,h).
 static const int ROT_PERM[6][3] = {
     {0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}
@@ -122,20 +135,41 @@ struct Pt {
     bool operator==(const Pt& o) const { return x == o.x && y == o.y && z == o.z; }
 };
 
+// Empty maximal AABB, or an EP stored as a degenerate box (w=d=h=0).
+struct EmsBox {
+    int x, y, z, w, d, h;
+    bool operator<(const EmsBox& o) const {
+        if (x != o.x) return x < o.x;
+        if (y != o.y) return y < o.y;
+        if (z != o.z) return z < o.z;
+        if (w != o.w) return w < o.w;
+        if (d != o.d) return d < o.d;
+        return h < o.h;
+    }
+    bool operator==(const EmsBox& o) const {
+        return x == o.x && y == o.y && z == o.z && w == o.w && d == o.d && h == o.h;
+    }
+};
+
 // One packed item: original index `id`, AABB (x,y,z)+(w,d,h), rotation index.
 struct Place {
     int id, x, y, z, w, d, h, rot;
 };
 
 // Partial packing of the current container. `g` is packed volume. Empty box
-// starts with a single EP at the origin. Beam search copies whole States.
+// has one origin EP and one full-container EMS. Beam copies whole States.
 struct State {
     long long g = 0;
     int nplaced = 0;
     int nep = 1;
+    int nems = 1;
     Place placed[MAX_PLACED];
     Pt eps[MAXEP];
-    State() { eps[0] = {0, 0, 0}; }
+    EmsBox ems[MAXEMS];
+    State() {
+        eps[0] = {0, 0, 0};
+        ems[0] = {0, 0, 0, 0, 0, 0};
+    }
 };
 
 int W, D, H, N;
@@ -163,6 +197,175 @@ double elapsed() {
     return chrono::duration<double>(chrono::steady_clock::now() - t0).count();
 }
 bool time_up() { return elapsed() > TIME_LIMIT; }
+
+State empty_box() {
+    State st;
+    st.nep = 1;
+    st.eps[0] = {0, 0, 0};
+    st.nems = 1;
+    st.ems[0] = {0, 0, 0, W, D, H};
+    return st;
+}
+
+bool ems_intersects_place(const EmsBox& e, const Place& k) {
+    return e.x < k.x + k.w && k.x < e.x + e.w && e.y < k.y + k.d && k.y < e.y + e.d &&
+           e.z < k.z + k.h && k.z < e.z + e.h;
+}
+
+bool ems_contains(const EmsBox& a, const EmsBox& b) {
+    return a.x <= b.x && a.y <= b.y && a.z <= b.z && a.x + a.w >= b.x + b.w &&
+           a.y + a.d >= b.y + b.d && a.z + a.h >= b.z + b.h;
+}
+
+void ems_push(vector<EmsBox>& o, int x, int y, int z, int w, int d, int h) {
+    if (w > 0 && d > 0 && h > 0) o.push_back({x, y, z, w, d, h});
+}
+
+// Lai–Chan difference process: one maximal empty box minus an intersecting
+// packed AABB yields at most 6 remnants (they overlap on purpose).
+void difference_split(const EmsBox& e, const Place& k, vector<EmsBox>& o) {
+    int x1 = e.x, x2 = e.x + e.w;
+    int y1 = e.y, y2 = e.y + e.d;
+    int z1 = e.z, z2 = e.z + e.h;
+    int x3 = k.x, x4 = k.x + k.w;
+    int y3 = k.y, y4 = k.y + k.d;
+    int z3 = k.z, z4 = k.z + k.h;
+    ems_push(o, x1, y1, z1, x3 - x1, y2 - y1, z2 - z1);
+    ems_push(o, x4, y1, z1, x2 - x4, y2 - y1, z2 - z1);
+    ems_push(o, x1, y1, z1, x2 - x1, y3 - y1, z2 - z1);
+    ems_push(o, x1, y4, z1, x2 - x1, y2 - y4, z2 - z1);
+    ems_push(o, x1, y1, z1, x2 - x1, y2 - y1, z3 - z1);
+    ems_push(o, x1, y1, z4, x2 - x1, y2 - y1, z2 - z4);
+}
+
+void commit_ems(State& st, vector<EmsBox>& pts) {
+    if (pts.empty()) {
+        st.nems = 1;
+        st.ems[0] = {0, 0, 0, 0, 0, 0};
+        return;
+    }
+    sort(pts.begin(), pts.end());
+    pts.erase(unique(pts.begin(), pts.end()), pts.end());
+    const int n = (int)pts.size();
+    vector<char> keep(n, 1);
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            if (i == j) continue;
+            if (!ems_contains(pts[j], pts[i])) continue;
+            if (ems_contains(pts[i], pts[j])) {
+                if (j < i) {
+                    keep[i] = 0;
+                    break;
+                }
+            } else {
+                keep[i] = 0;
+                break;
+            }
+        }
+    }
+    vector<EmsBox> maximal;
+    maximal.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        if (keep[i]) maximal.push_back(pts[i]);
+    }
+    int m = (int)maximal.size();
+    if (m > MAXEMS) {
+        sort(maximal.begin(), maximal.end(), [](const EmsBox& a, const EmsBox& b) {
+            int ma = min({a.w, a.d, a.h});
+            int mb = min({b.w, b.d, b.h});
+            if (ma != mb) return ma > mb;
+            return 1LL * a.w * a.d * a.h > 1LL * b.w * b.d * b.h;
+        });
+        maximal.resize(MAXEMS);
+        sort(maximal.begin(), maximal.end());
+        m = MAXEMS;
+    }
+    st.nems = m;
+    memcpy(st.ems, maximal.data(), (size_t)m * sizeof(EmsBox));
+}
+
+void update_ems(State& st, const Place& k) {
+    vector<EmsBox> nxt;
+    nxt.reserve((size_t)st.nems * 6 + 8);
+    for (int i = 0; i < st.nems; ++i) {
+        const EmsBox& e = st.ems[i];
+        if (!ems_intersects_place(e, k)) {
+            nxt.push_back(e);
+            continue;
+        }
+        difference_split(e, k, nxt);
+    }
+    commit_ems(st, nxt);
+}
+
+// Item origins on the floor of EMS `e`. LBB of a maximal box is often floating
+// (the -z block may sit on the opposite corner of the bottom face). Also try
+// the other three bottom corners, plus corners of packed tops that actually
+// meet this floor — those are the supported ledges the LBB misses.
+static const int MAX_EMS_ORIGINS = 12;
+
+void ems_try_origin(vector<Pt>& o, const EmsBox& e, int x, int y, int iw, int id) {
+    if (x < e.x || y < e.y) return;
+    if (x + iw > e.x + e.w || y + id > e.y + e.d) return;
+    o.push_back({x, y, e.z});
+}
+
+void ems_placement_origins(const State& st, const EmsBox& e, int iw, int id, vector<Pt>& o) {
+    o.clear();
+    if (iw > e.w || id > e.d) return;
+    int x0 = e.x, x1 = e.x + e.w - iw;
+    int y0 = e.y, y1 = e.y + e.d - id;
+    ems_try_origin(o, e, x0, y0, iw, id);
+    ems_try_origin(o, e, x1, y0, iw, id);
+    ems_try_origin(o, e, x0, y1, iw, id);
+    ems_try_origin(o, e, x1, y1, iw, id);
+    if (e.z > 0) {
+        for (int i = 0; i < st.nplaced; ++i) {
+            const Place& p = st.placed[i];
+            if (p.z + p.h != e.z) continue;
+            int ox0 = max(p.x, e.x), ox1 = min(p.x + p.w, e.x + e.w);
+            int oy0 = max(p.y, e.y), oy1 = min(p.y + p.d, e.y + e.d);
+            if (ox1 <= ox0 || oy1 <= oy0) continue;
+            ems_try_origin(o, e, ox0, oy0, iw, id);
+            ems_try_origin(o, e, ox1 - iw, oy0, iw, id);
+            ems_try_origin(o, e, ox0, oy1 - id, iw, id);
+            ems_try_origin(o, e, ox1 - iw, oy1 - id, iw, id);
+            int fx0 = max(e.x, p.x), fx1 = min(e.x + e.w - iw, p.x + p.w - iw);
+            int fy0 = max(e.y, p.y), fy1 = min(e.y + e.d - id, p.y + p.d - id);
+            if (fx0 <= fx1 && fy0 <= fy1) {
+                ems_try_origin(o, e, fx0, fy0, iw, id);
+                ems_try_origin(o, e, fx1, fy0, iw, id);
+                ems_try_origin(o, e, fx0, fy1, iw, id);
+                ems_try_origin(o, e, fx1, fy1, iw, id);
+            }
+            if ((int)o.size() >= MAX_EMS_ORIGINS * 3) break;
+        }
+    }
+    sort(o.begin(), o.end());
+    o.erase(unique(o.begin(), o.end()), o.end());
+    if ((int)o.size() > MAX_EMS_ORIGINS) o.resize(MAX_EMS_ORIGINS);
+}
+
+// Union of EMS supported corners and EP points, then unique. Scoring later
+// uses residual_box at each origin so the two sources share one scale.
+void collect_candidate_origins(const State& st, int iw, int id, int ih, vector<Pt>& o) {
+    o.clear();
+    if (g_use_ems) {
+        vector<Pt> local;
+        for (int e = 0; e < st.nems; ++e) {
+            const EmsBox& g = st.ems[e];
+            if (iw > g.w || id > g.d || ih > g.h) continue;
+            ems_placement_origins(st, g, iw, id, local);
+            o.insert(o.end(), local.begin(), local.end());
+        }
+    }
+    if (g_use_ep) {
+        for (int e = 0; e < st.nep; ++e) o.push_back(st.eps[e]);
+    }
+    if (o.empty()) return;
+    sort(o.begin(), o.end());
+    o.erase(unique(o.begin(), o.end()), o.end());
+}
 
 void rotated_size(int id, int rot, int& w, int& d, int& h) {
     w = orig[id][ROT_PERM[rot][0]];
@@ -305,21 +508,37 @@ int height_mismatch(const State& st, int x, int y, int z, int w, int d, int h) {
     return best;
 }
 
-// Beam tie-break from leftover cavities at current EPs. A residual shorter
-// than g_typical_edge is treated as a dead sliver (future arrived SKUs are
-// unlikely to fit). Reward one large usable pocket; penalize fragmented waste.
+// Beam tie-break from leftover cavities. Prefer EMS boxes when that list is
+// live (true empty volume). EP-only mode grows residual_box from each point.
+// Do not add both: overlapping EMS already over-counts, EP residuals would
+// mix a second scale into the same rank.
 long long cavity_tiebreak(const State& st) {
     long long max_cav = 0, sum_cav = 0, dead = 0;
-    int seen = min(st.nep, MAXEP);
-    for (int e = 0; e < seen; ++e) {
-        Res r = residual_box(st, st.eps[e].x, st.eps[e].y, st.eps[e].z);
-        int me = min({r.x, r.y, r.z});
-        long long v = 1LL * r.x * r.y * r.z;
-        if (me >= g_typical_edge) {
-            max_cav = max(max_cav, v);
-            sum_cav += v;
-        } else {
-            dead += v;
+    if (g_use_ems) {
+        int seen = min(st.nems, MAXEMS);
+        for (int e = 0; e < seen; ++e) {
+            const EmsBox& g = st.ems[e];
+            int me = min({g.w, g.d, g.h});
+            long long v = 1LL * g.w * g.d * g.h;
+            if (me >= g_typical_edge) {
+                max_cav = max(max_cav, v);
+                sum_cav += v;
+            } else {
+                dead += v;
+            }
+        }
+    } else {
+        int seen = min(st.nep, MAXEP);
+        for (int e = 0; e < seen; ++e) {
+            Res r = residual_box(st, st.eps[e].x, st.eps[e].y, st.eps[e].z);
+            int me = min({r.x, r.y, r.z});
+            long long v = 1LL * r.x * r.y * r.z;
+            if (me >= g_typical_edge) {
+                max_cav = max(max_cav, v);
+                sum_cav += v;
+            } else {
+                dead += v;
+            }
         }
     }
     return max_cav / 1000 + sum_cav / 8000 - dead * 4;
@@ -488,7 +707,8 @@ void apply_place(State& st, int id, int rot, int x, int y, int z, int w, int d, 
     Place p{id, x, y, z, w, d, h, rot};
     st.placed[st.nplaced++] = p;
     st.g += vol[id];
-    update_eps(st, p);
+    if (g_use_ems) update_ems(st, p);
+    if (g_use_ep) update_eps(st, p);
 }
 
 bool is_packed(const State& st, int id) {
@@ -527,11 +747,11 @@ long long compactness(const State& st) {
         maxz = max(maxz, p.z + p.h);
     }
     c += 1LL * maxx * maxy / 8 + maxz;
-    c += 3LL * st.nep;
+    c += 3LL * (g_use_ep ? st.nep : 0) + 3LL * (g_use_ems ? st.nems : 0);
     return c;
 }
 
-// Any EP + rotation that is currently feasible. Used only to detect stranded
+// Any candidate + rotation that is currently feasible. Used only to detect stranded
 // large pending SKUs (not to pick a pose).
 bool item_fits_somewhere(const State& st, int id) {
     int lw = -1, ld = -1, lh = -1;
@@ -543,8 +763,10 @@ bool item_fits_somewhere(const State& st, int id) {
         ld = d;
         lh = h;
         if (w > W || d > D || h > H) continue;
-        for (int e = 0; e < st.nep; ++e) {
-            if (feasible(st, st.eps[e].x, st.eps[e].y, st.eps[e].z, w, d, h)) return true;
+        vector<Pt> origins;
+        collect_candidate_origins(st, w, d, h, origins);
+        for (const Pt& p : origins) {
+            if (feasible(st, p.x, p.y, p.z, w, d, h)) return true;
         }
     }
     return false;
@@ -570,13 +792,19 @@ long long pending_unplaceable_vol(const State& st) {
 }
 
 // Same SKU, different pose: prefer tight cavities, height-aligned stacks,
-// and wall/item contact. `r` is the residual already computed at this EP.
+// and wall/item contact. `r` is the residual already computed at this origin.
+// Filling an EMS all the way to the lid is a local best-fit that seals a
+// column; penalise it so a slightly looser lower pose can win.
 long long place_score(const State& st, const Res& r, int x, int y, int z, int w, int d, int h,
                       int id) {
     long long contact = contact_area(st, x, y, z, w, d, h);
-    if (cavity_too_big(r, w, d, h)) return vol[id] + contact / 3;
+    long long lid = 0;
+    if (z + h == H && r.z == h) {
+        lid = 3LL * w * d * max(g_typical_edge, 180);
+    }
+    if (cavity_too_big(r, w, d, h)) return vol[id] + contact / 3 - lid;
     return vol[id] / 10 - cavity_waste(r, w, d, h) - 80LL * height_mismatch(st, x, y, z, w, d, h) +
-           contact / 3;
+           contact / 3 - lid;
 }
 
 // Layer ranking: packed volume dominates; compactness and leftover cavities
@@ -593,17 +821,29 @@ bool better_state(const State& a, const State& b) {
 
 // Fingerprint of a packing for beam dedup (ids + a few EPs). Same geometry
 // reached by different placement orders collapses to one beam slot.
-uint64_t ep_sig(const State& st) {
+uint64_t geom_sig(const State& st) {
     uint64_t h = st.g ^ (uint64_t)st.nplaced * 0x9e3779b97f4a7c15ULL;
     for (int i = 0; i < st.nplaced; ++i) {
         h ^= (uint64_t)(st.placed[i].id + 1) * 1000003ULL;
         h = (h << 7) | (h >> 57);
     }
-    int take = min(st.nep, 12);
-    for (int i = 0; i < take; ++i) {
-        h ^= (uint64_t)(st.eps[i].x + 1) * 1000003ULL;
-        h ^= (uint64_t)(st.eps[i].y + 1) * 1000033ULL;
-        h ^= (uint64_t)(st.eps[i].z + 1) * 1000037ULL;
+    int take_ep = min(st.nep, 8);
+    for (int i = 0; i < take_ep; ++i) {
+        const Pt& p = st.eps[i];
+        h ^= (uint64_t)(p.x + 1) * 1000003ULL;
+        h ^= (uint64_t)(p.y + 1) * 1000033ULL;
+        h ^= (uint64_t)(p.z + 1) * 1000037ULL;
+        h = (h << 7) | (h >> 57);
+    }
+    int take_ems = min(st.nems, 8);
+    for (int i = 0; i < take_ems; ++i) {
+        const EmsBox& g = st.ems[i];
+        h ^= (uint64_t)(g.x + 1) * 1000039ULL;
+        h ^= (uint64_t)(g.y + 1) * 1000081ULL;
+        h ^= (uint64_t)(g.z + 1) * 1000099ULL;
+        h ^= (uint64_t)(g.w + 1) * 1000117ULL;
+        h ^= (uint64_t)(g.d + 1) * 1000133ULL;
+        h ^= (uint64_t)(g.h + 1) * 1000151ULL;
         h = (h << 7) | (h >> 57);
     }
     return h;
@@ -614,7 +854,7 @@ struct Keep {
     int id, rot, x, y, z, w, d, h;
 };
 
-// Enumerate 6 rotations × all EPs, score legal poses, keep pos_keep best.
+// Enumerate 6 rotations × all EMS/EP candidates, score legal poses, keep pos_keep best.
 // tight_only: only non-huge cavities with waste <= 2x item vol (sliver fill
 // after topping up the buffer). Otherwise, if any non-huge pose exists, drop
 // huge ones so small SKUs do not occupy a cavern meant for later larges.
@@ -636,8 +876,10 @@ void collect_placements(const State& u, int id, int pos_keep, vector<Keep>& tops
         lastd = d;
         lasth = h;
         if (w > W || d > D || h > H) continue;
-        for (int e = 0; e < u.nep; ++e) {
-            int x = u.eps[e].x, y = u.eps[e].y, z = u.eps[e].z;
+        vector<Pt> origins;
+        collect_candidate_origins(u, w, d, h, origins);
+        for (const Pt& p : origins) {
+            int x = p.x, y = p.y, z = p.z;
             if (!feasible(u, x, y, z, w, d, h)) continue;
             Res rs = residual_box(u, x, y, z);
             Keep k{place_score(u, rs, x, y, z, w, d, h, id), id, r, x, y, z, w, d, h};
@@ -787,7 +1029,7 @@ bool buffer_round(vector<State>& cur, vector<State>& cand, vector<State>& nxt, i
         }
     } else {
         // Independent expand_state per beam member. dynamic,1 because residual
-        // cost varies with nep × placed. Merge thread-local lists after the barrier.
+        // cost varies with candidates × placed. Merge thread-local lists after the barrier.
         vector<vector<State>> local((size_t)nt);
         vector<unsigned char> prog((size_t)nt, 0);
         for (auto& v : local) v.reserve((cand.capacity() / (size_t)nt) + 8);
@@ -832,8 +1074,8 @@ bool any_pending_over(const vector<State>& cur, int max_pending) {
 
 // Keep `beam` successors: sort by state_rank, then on the top pool subtract
 // unplaceable large-SKU volume so a slightly emptier layout that can still
-// take a big pending item beats a greedy fill that traps it. Dedup by ep_sig
-// and bucket by EP count so one contour family cannot occupy every slot.
+// take a big pending item beats a greedy fill that traps it. Dedup by geom_sig
+// and bucket by cavity count so one contour family cannot occupy every slot.
 void select_top(vector<State>& cand, int beam, vector<State>& nxt) {
     int m = (int)cand.size();
     vector<int> idx(m);
@@ -864,15 +1106,15 @@ void select_top(vector<State>& cand, int beam, vector<State>& nxt) {
     nxt.clear();
     unordered_set<uint64_t> seen;
     seen.reserve((size_t)beam * 2);
-    // Bucket by EP count / 6: similar "how fragmented is empty space" layouts
+    // Bucket by cavity count / 6: similar "how fragmented is empty space" layouts
     // share a bucket. Cap ~beam/8 each, overflow fills remaining slots by rank.
     int bucket_used[32] = {};
     int cap_per_bucket = max(2, beam / 8);
     vector<int> overflow;
     for (int id : idx) {
-        uint64_t sig = ep_sig(cand[id]);
+        uint64_t sig = geom_sig(cand[id]);
         if (!seen.insert(sig).second) continue;
-        int b = min(31, cand[id].nep / 6);
+        int b = min(31, (cand[id].nep + cand[id].nems) / 6);
         if ((int)nxt.size() < beam && bucket_used[b] < cap_per_bucket) {
             nxt.push_back(cand[id]);
             ++bucket_used[b];
@@ -958,13 +1200,29 @@ int main(int argc, char** argv) {
             g_nthreads = max(1, stoi(a));
             continue;
         }
-        cerr << "unknown arg '" << a << "', expected a thread count\n";
+        if (a == "ems") {
+            g_use_ems = true;
+            g_use_ep = false;
+            continue;
+        }
+        if (a == "ep") {
+            g_use_ems = false;
+            g_use_ep = true;
+            continue;
+        }
+        if (a == "both") {
+            g_use_ems = true;
+            g_use_ep = true;
+            continue;
+        }
+        cerr << "unknown arg '" << a << "', expected a thread count or both/ems/ep\n";
         return 1;
     }
     omp_set_dynamic(0);
     omp_set_num_threads(g_nthreads);
     cerr << fixed << setprecision(4);
-    cerr << "threads " << g_nthreads << '\n';
+    const char* geom = (g_use_ems && g_use_ep) ? "both" : (g_use_ems ? "ems" : "ep");
+    cerr << "threads " << g_nthreads << "  geom " << geom << '\n';
 
     if (!(cin >> W >> D >> H)) return 0;
     {
@@ -997,14 +1255,14 @@ int main(int argc, char** argv) {
         g_open.swap(keep);
     };
 
-    // One container: reset the 55s clock. Leftover from the previous box
+    // One container: reset the 90s clock. Leftover from the previous box
     // is already in g_open (buffer).
     while (next_item < N || !g_open.empty()) {
         t0 = chrono::steady_clock::now();
         skip_unfittable_open();
         if (g_open.empty() && next_item >= N) break;
 
-        vector<State> cur(1), nxt, cand;
+        vector<State> cur(1, empty_box()), nxt, cand;
         cand.reserve(beam * (size_t)OPEN_CAP * (size_t)pos_keep + 8);
         State best;
 
