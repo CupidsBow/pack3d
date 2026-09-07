@@ -47,7 +47,8 @@
     1. Fill the buffer: while pending < 12 and the stream is not empty, take 1.
     2. Beam-search up to CHUNK_K further placements from the current window.
     3. Commit the best of those states (most items this chunk, then state_rank).
-    4. If the stream is exhausted: force_room(0) and seal.
+    4. If the stream is exhausted: keep placing (tight, then any pose) until
+       stuck, then seal.
     5. If the chunk packed at least one item, go back to 1.
     6. If nothing packed, seal. Leftover g_open items go to the next box.
 
@@ -135,7 +136,7 @@ struct Pt {
     bool operator==(const Pt& o) const { return x == o.x && y == o.y && z == o.z; }
 };
 
-// Empty maximal AABB, or an EP stored as a degenerate box (w=d=h=0).
+// Empty maximal AABB (Lai–Chan remnant). EPs are stored separately as Pt.
 struct EmsBox {
     int x, y, z, w, d, h;
     bool operator<(const EmsBox& o) const {
@@ -304,21 +305,21 @@ void update_ems(State& st, const Place& k) {
 // meet this floor — those are the supported ledges the LBB misses.
 static const int MAX_EMS_ORIGINS = 12;
 
-void ems_try_origin(vector<Pt>& o, const EmsBox& e, int x, int y, int iw, int id) {
+void ems_try_origin(vector<Pt>& o, const EmsBox& e, int x, int y, int item_w, int item_d) {
     if (x < e.x || y < e.y) return;
-    if (x + iw > e.x + e.w || y + id > e.y + e.d) return;
+    if (x + item_w > e.x + e.w || y + item_d > e.y + e.d) return;
     o.push_back({x, y, e.z});
 }
 
-void ems_placement_origins(const State& st, const EmsBox& e, int iw, int id, vector<Pt>& o) {
+void ems_placement_origins(const State& st, const EmsBox& e, int item_w, int item_d, vector<Pt>& o) {
     o.clear();
-    if (iw > e.w || id > e.d) return;
-    int x0 = e.x, x1 = e.x + e.w - iw;
-    int y0 = e.y, y1 = e.y + e.d - id;
-    ems_try_origin(o, e, x0, y0, iw, id);
-    ems_try_origin(o, e, x1, y0, iw, id);
-    ems_try_origin(o, e, x0, y1, iw, id);
-    ems_try_origin(o, e, x1, y1, iw, id);
+    if (item_w > e.w || item_d > e.d) return;
+    int x0 = e.x, x1 = e.x + e.w - item_w;
+    int y0 = e.y, y1 = e.y + e.d - item_d;
+    ems_try_origin(o, e, x0, y0, item_w, item_d);
+    ems_try_origin(o, e, x1, y0, item_w, item_d);
+    ems_try_origin(o, e, x0, y1, item_w, item_d);
+    ems_try_origin(o, e, x1, y1, item_w, item_d);
     if (e.z > 0) {
         for (int i = 0; i < st.nplaced; ++i) {
             const Place& p = st.placed[i];
@@ -326,17 +327,19 @@ void ems_placement_origins(const State& st, const EmsBox& e, int iw, int id, vec
             int ox0 = max(p.x, e.x), ox1 = min(p.x + p.w, e.x + e.w);
             int oy0 = max(p.y, e.y), oy1 = min(p.y + p.d, e.y + e.d);
             if (ox1 <= ox0 || oy1 <= oy0) continue;
-            ems_try_origin(o, e, ox0, oy0, iw, id);
-            ems_try_origin(o, e, ox1 - iw, oy0, iw, id);
-            ems_try_origin(o, e, ox0, oy1 - id, iw, id);
-            ems_try_origin(o, e, ox1 - iw, oy1 - id, iw, id);
-            int fx0 = max(e.x, p.x), fx1 = min(e.x + e.w - iw, p.x + p.w - iw);
-            int fy0 = max(e.y, p.y), fy1 = min(e.y + e.d - id, p.y + p.d - id);
+            // Corners of this top ∩ EMS floor, plus item-flush origins on that
+            // top so the parcel need not sit at the (often floating) EMS LBB.
+            ems_try_origin(o, e, ox0, oy0, item_w, item_d);
+            ems_try_origin(o, e, ox1 - item_w, oy0, item_w, item_d);
+            ems_try_origin(o, e, ox0, oy1 - item_d, item_w, item_d);
+            ems_try_origin(o, e, ox1 - item_w, oy1 - item_d, item_w, item_d);
+            int fx0 = max(e.x, p.x), fx1 = min(e.x + e.w - item_w, p.x + p.w - item_w);
+            int fy0 = max(e.y, p.y), fy1 = min(e.y + e.d - item_d, p.y + p.d - item_d);
             if (fx0 <= fx1 && fy0 <= fy1) {
-                ems_try_origin(o, e, fx0, fy0, iw, id);
-                ems_try_origin(o, e, fx1, fy0, iw, id);
-                ems_try_origin(o, e, fx0, fy1, iw, id);
-                ems_try_origin(o, e, fx1, fy1, iw, id);
+                ems_try_origin(o, e, fx0, fy0, item_w, item_d);
+                ems_try_origin(o, e, fx1, fy0, item_w, item_d);
+                ems_try_origin(o, e, fx0, fy1, item_w, item_d);
+                ems_try_origin(o, e, fx1, fy1, item_w, item_d);
             }
             if ((int)o.size() >= MAX_EMS_ORIGINS * 3) break;
         }
@@ -348,14 +351,14 @@ void ems_placement_origins(const State& st, const EmsBox& e, int iw, int id, vec
 
 // Union of EMS supported corners and EP points, then unique. Scoring later
 // uses residual_box at each origin so the two sources share one scale.
-void collect_candidate_origins(const State& st, int iw, int id, int ih, vector<Pt>& o) {
+void collect_candidate_origins(const State& st, int item_w, int item_d, int item_h, vector<Pt>& o) {
     o.clear();
     if (g_use_ems) {
         vector<Pt> local;
         for (int e = 0; e < st.nems; ++e) {
             const EmsBox& g = st.ems[e];
-            if (iw > g.w || id > g.d || ih > g.h) continue;
-            ems_placement_origins(st, g, iw, id, local);
+            if (item_w > g.w || item_d > g.d || item_h > g.h) continue;
+            ems_placement_origins(st, g, item_w, item_d, local);
             o.insert(o.end(), local.begin(), local.end());
         }
     }
@@ -701,7 +704,7 @@ void update_eps(State& st, const Place& k) {
     commit_eps(st, pts);
 }
 
-// Commit a pose: append Place, add volume, rebuild EPs from the new AABB.
+// Commit a pose: append Place, add volume, update EMS and/or EPs.
 void apply_place(State& st, int id, int rot, int x, int y, int z, int w, int d, int h) {
     if (st.nplaced >= MAX_PLACED) return;
     Place p{id, x, y, z, w, d, h, rot};
@@ -733,9 +736,9 @@ bool item_fits_empty(int id) {
     return false;
 }
 
-// Spread penalty: sum of min-corners + bounding-box footprint + EP count.
-// Subtracted in state_rank so two equal-volume packs prefer the denser one
-// (items pulled toward origin, fewer leftover corners).
+// Spread penalty: sum of min-corners + bounding-box footprint + leftover
+// candidate count. Subtracted in state_rank so two equal-volume packs prefer
+// the denser one (items pulled toward origin, fewer leftover corners).
 long long compactness(const State& st) {
     long long c = 0;
     int maxx = 0, maxy = 0, maxz = 0;
@@ -773,7 +776,7 @@ bool item_fits_somewhere(const State& st, int id) {
 }
 
 // Penalise layouts that already cannot place the largest pending SKUs.
-// Only the 4 largest unpacked items in the window are checked (EP scan).
+// Only the 4 largest unpacked items in the window are checked.
 long long pending_unplaceable_vol(const State& st) {
     int ids[OPEN_CAP], nids = 0;
     for (int id : g_open) {
@@ -819,7 +822,7 @@ bool better_state(const State& a, const State& b) {
     return a.nplaced > b.nplaced;
 }
 
-// Fingerprint of a packing for beam dedup (ids + a few EPs). Same geometry
+// Fingerprint of a packing for beam dedup (ids + a few EPs/EMS). Same geometry
 // reached by different placement orders collapses to one beam slot.
 uint64_t geom_sig(const State& st) {
     uint64_t h = st.g ^ (uint64_t)st.nplaced * 0x9e3779b97f4a7c15ULL;
@@ -855,14 +858,13 @@ struct Keep {
 };
 
 // Enumerate 6 rotations × all EMS/EP candidates, score legal poses, keep pos_keep best.
-// tight_only: only non-huge cavities with waste <= 2x item vol (sliver fill
-// after topping up the buffer). Otherwise, if any non-huge pose exists, drop
-// huge ones so small SKUs do not occupy a cavern meant for later larges.
+// tight_only: only non-huge cavities with waste <= 2x item vol (sliver fill).
+// Otherwise, if any non-huge pose exists, drop huge ones so small SKUs do not
+// occupy a cavern meant for later larges.
 void collect_placements(const State& u, int id, int pos_keep, vector<Keep>& tops, bool tight_only) {
     tops.clear();
     struct Row {
         Keep k;
-        Res r;
         long long waste;
         bool huge;
     };
@@ -883,7 +885,7 @@ void collect_placements(const State& u, int id, int pos_keep, vector<Keep>& tops
             if (!feasible(u, x, y, z, w, d, h)) continue;
             Res rs = residual_box(u, x, y, z);
             Keep k{place_score(u, rs, x, y, z, w, d, h, id), id, r, x, y, z, w, d, h};
-            rows.push_back(Row{k, rs, cavity_waste(rs, w, d, h), cavity_too_big(rs, w, d, h)});
+            rows.push_back(Row{k, cavity_waste(rs, w, d, h), cavity_too_big(rs, w, d, h)});
         }
     }
     if (rows.empty()) return;
@@ -904,8 +906,8 @@ void collect_placements(const State& u, int id, int pos_keep, vector<Keep>& tops
             }
         }
         if (any_tight) {
-            // Normal FFD: a small SKU must not sit in a huge leftover cavity
-            // when a tighter pose exists (keep the cavern for a later large).
+            // A small SKU must not sit in a huge leftover cavity when a tighter
+            // pose exists (keep the cavern for a later large).
             vector<Row> kept;
             for (const Row& row : rows) {
                 if (!row.huge) kept.push_back(row);
@@ -944,27 +946,6 @@ void list_pending(const State& u, vector<int>& ids) {
     }
 }
 
-// FFD order: park by smallest min-edge first (then volume). Those stay in buffer.
-bool smaller_filler(int a, int b) {
-    if (min_edge[a] != min_edge[b]) return min_edge[a] < min_edge[b];
-    return vol[a] < vol[b];
-}
-
-// FFD leave-set: park the `max_pending` smallest-min-edge items in the
-// buffer; everyone else must be packed this round. max_pending 0 / <0 =
-// attempt every pending SKU (seal squeeze).
-void must_leave_pending(vector<int> ids, int max_pending, vector<int>& leave) {
-    leave.clear();
-    if (ids.empty()) return;
-    if (max_pending < 0 || max_pending == 0) {
-        leave = std::move(ids);
-        return;
-    }
-    sort(ids.begin(), ids.end(), smaller_filler);
-    if ((int)ids.size() <= max_pending) return;
-    leave.assign(ids.begin() + max_pending, ids.end());
-}
-
 void select_top(vector<State>& cand, int beam, vector<State>& nxt);
 
 // Try each SKU in `ids` independently (one extra item per successor). Does not
@@ -979,14 +960,10 @@ void expand_pending(const State& u, const vector<int>& ids, int pos_keep, vector
     }
 }
 
-// One successor generation from state `u`.
-//   time_up / already under max_pending / nothing to pack -> copy `u` through.
-//   tight_only: every pending SKU is a candidate (sliver fill).
-//   else: FFD leave-set from must_leave_pending (pack larges, park fillers);
-//         max_pending 0 / <0 tries every pending SKU.
-// If no legal pose exists, copy `u` unchanged so the beam does not die;
-// progress stays false and the outer loop can seal.
-void expand_state(const State& u, vector<State>& out, int pos_keep, int max_pending, bool tight_only,
+// One successor generation from state `u`. Every pending SKU is a candidate.
+// time_up / nothing to pack / no legal pose -> copy `u` through so the beam
+// does not die; progress stays false and the outer loop can seal.
+void expand_state(const State& u, vector<State>& out, int pos_keep, bool tight_only,
                  bool* progress) {
     if (time_up()) {
         out.push_back(u);
@@ -995,37 +972,28 @@ void expand_state(const State& u, vector<State>& out, int pos_keep, int max_pend
     vector<int> ids;
     ids.reserve(OPEN_CAP);
     list_pending(u, ids);
-    int pc = (int)ids.size();
-    if (pc == 0 || (max_pending >= 0 && pc <= max_pending)) {
-        out.push_back(u);
-        return;
-    }
-    vector<int> leave;
-    if (tight_only) leave = ids;
-    else must_leave_pending(ids, max_pending, leave);
-    if (leave.empty()) {
+    if (ids.empty()) {
         out.push_back(u);
         return;
     }
     size_t n0 = out.size();
-    expand_pending(u, leave, pos_keep, out, tight_only);
+    expand_pending(u, ids, pos_keep, out, tight_only);
     if (out.size() == n0) out.push_back(u);
     else if (progress) *progress = true;
 }
 
 // One beam layer: each live state tries to pack one more pending item.
-// max_pending >= 0 stops expanding once pending is small enough.
 // tight_only uses the sliver filter. States are independent; OpenMP splits
 // `cur` with per-thread candidate lists, then ranks and truncates to `beam`.
 bool buffer_round(vector<State>& cur, vector<State>& cand, vector<State>& nxt, int beam,
-                  int pos_keep, State& best, int max_pending, bool tight_only) {
+                  int pos_keep, State& best, bool tight_only) {
     cand.clear();
     bool progress = false;
     const int ns = (int)cur.size();
     const int nt = max(1, g_nthreads);
     if (nt == 1 || ns <= 1) {
         for (const State& u : cur) {
-            expand_state(u, cand, pos_keep, max_pending, tight_only, &progress);
+            expand_state(u, cand, pos_keep, tight_only, &progress);
         }
     } else {
         // Independent expand_state per beam member. dynamic,1 because residual
@@ -1039,7 +1007,7 @@ bool buffer_round(vector<State>& cur, vector<State>& cand, vector<State>& nxt, i
             bool local_prog = false;
 #pragma omp for schedule(dynamic, 1)
             for (int i = 0; i < ns; ++i) {
-                expand_state(cur[i], local[tid], pos_keep, max_pending, tight_only, &local_prog);
+                expand_state(cur[i], local[tid], pos_keep, tight_only, &local_prog);
             }
             if (local_prog) prog[tid] = 1;
         }
@@ -1083,7 +1051,7 @@ void select_top(vector<State>& cand, int beam, vector<State>& nxt) {
     vector<long long> rank(m);
     const int nt = max(1, g_nthreads);
     if (nt > 1 && m > 8) {
-        // residual_box inside cavity_tiebreak is the expensive part of rank.
+        // state_rank is the cost; EP-only mode also runs residual_box per point.
 #pragma omp parallel for num_threads(nt) schedule(static)
         for (int i = 0; i < m; ++i) rank[i] = state_rank(cand[i]);
     } else {
@@ -1236,7 +1204,7 @@ int main(int argc, char** argv) {
     N = (int)orig.size();
 
     int beam = 480;     // live partial packs per layer
-    int pos_keep = 3;   // poses kept per (state, SKU) after scoring EPs
+    int pos_keep = 3;   // poses kept per (state, SKU) after place_score
     long long box_vol = 1LL * W * D * H;
     vector<double> rates;
     vector<BinDump> dumps;
@@ -1282,40 +1250,21 @@ int main(int argc, char** argv) {
             }
         };
 
-        // Pack until every beam member has pending <= max_pend (FFD if
-        // max_pend > 0). False means some state is stuck above the cap.
-        auto force_room = [&](int max_pend) -> bool {
-            int guard = 0;
-            while (any_pending_over(cur, max_pend) && guard++ < 10000) {
-                if (!buffer_round(cur, cand, nxt, beam, pos_keep, best, max_pend, false)) {
-                    break;
-                }
-            }
-            return !any_pending_over(cur, max_pend);
+        // Tight poses first, then any legal pose. False = nobody packed this layer.
+        auto pack_one_layer = [&]() -> bool {
+            if (buffer_round(cur, cand, nxt, beam, pos_keep, best, true)) return true;
+            return buffer_round(cur, cand, nxt, beam, pos_keep, best, false);
         };
 
+        // Fill window → search up to CHUNK_K layers → commit one state.
+        // Seal when a chunk packs nothing, or after draining the stream.
         while (true) {
-            int pending_before = cur.empty() ? 0 : pending_count(cur[0]);
-            int seen_before = g_seen;
             fill_buffer();
-            int admitted = g_seen - seen_before;
-            int pending_now = cur.empty() ? (int)g_open.size() : pending_count(cur[0]);
 
             if (next_item >= N) {
                 int guard = 0;
-                int extra = 0;
-                while (guard++ < 10000) {
-                    if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, true)) {
-                        ++extra;
-                        continue;
-                    }
-                    if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, false)) {
-                        ++extra;
-                        continue;
-                    }
-                    break;
+                while (guard++ < 10000 && pack_one_layer()) {
                 }
-                force_room(0);
                 break;
             }
 
@@ -1326,15 +1275,8 @@ int main(int argc, char** argv) {
             int got = 0;
             int guard = 0;
             while (got < CHUNK_K && guard++ < 10000) {
-                if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, true)) {
-                    ++got;
-                    continue;
-                }
-                if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, false)) {
-                    ++got;
-                    continue;
-                }
-                break;
+                if (!pack_one_layer()) break;
+                ++got;
             }
             if (got == 0) {
                 break;
@@ -1360,7 +1302,6 @@ int main(int argc, char** argv) {
             cur.clear();
             cur.push_back(chosen);
             best = chosen;
-            double fill = box_vol ? 100.0 * chosen.g / box_vol : 0.0;
         }
         for (const State& u : cur) {
             if (better_state(u, best)) best = u;

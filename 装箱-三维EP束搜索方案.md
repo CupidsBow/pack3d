@@ -59,7 +59,7 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 
 ```
 1. 填缓冲：pending < 12 且流未尽，一次取 1 件。
-2. 流已尽：继续装到装不动，force_room(0)，封箱。
+2. 流已尽：tight / 任意姿态一直装到装不动，封箱。
 3. 否则对当前窗口束搜索最多 8 层（先 tight，没有再用任意姿态）。
 4. 在达到本轮最多装件数的状态里，按 state_rank 落实一个，beam 收成这一份。
 5. 本轮至少装成 1 件：回到 1 补槽。
@@ -141,7 +141,7 @@ rank = g·10000 − compactness·20 + cavity_tiebreak
 ## 一层束搜索
 
 ```
-buffer_round(cur, max_pending, tight_only):
+buffer_round(cur, tight_only):
     对 cur 里每个状态 Expand（OpenMP 按状态切开）
     用 better_state 更新 best
     select_top → 留下 beam 个，作为下一层 cur
@@ -149,8 +149,7 @@ buffer_round(cur, max_pending, tight_only):
 ```
 
 `Expand` 一次只多装 **一件**（每个候选 SKU 独立试 `pos_keep` 个姿态）。  
-`max_pending ≥ 0` 且 pending 已 ≤ 该值：原样留下。  
-装不出合法姿态：也原样留下，progress 为假，外层可以封箱。
+pending 为空、超时或没有合法姿态：原样留下，progress 为假，外层可以封箱。
 
 `select_top`：
 
@@ -197,6 +196,7 @@ CHUNK_K       8       每轮从窗口搜这么多层，落实最好状态后再�
                   Feasible → residual_box → place_score 留 pos_keep
                   UpdateEMS 且/或 UpdateEPs
                   state_rank + 大件惩罚 + 去重分桶
+            （先 tight，没有再用任意姿态）
 ```
 
 ---
