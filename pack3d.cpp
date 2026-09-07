@@ -28,26 +28,24 @@
   ---------------------------------------------------------------------------
   Production window (not "see all remaining SKUs")
   ---------------------------------------------------------------------------
-  Items arrive in batches of BATCH_SIZE (10) on a conveyor. Those 10 do not
-  occupy the staging buffer. The buffer holds at most BUFFER_CAP (12) unpacked
-  items. The next conveyor batch is admitted only after every unpacked item
-  fits in the buffer — i.e. pending <= 12 — meaning the current conveyor has
-  been packed or parked. At most OPEN_CAP = 22 SKUs are packable at once.
+  The line feeds one parcel at a time. The staging buffer holds at most
+  BUFFER_CAP (12) unpacked items; that is also the packable window (OPEN_CAP).
+  Never more than 12 unpacked SKUs at once. Fill the buffer, then run CHUNK_K
+  (8) beam layers on that frozen window (each layer places one more item). Among
+  the resulting states pick the best evaluation and commit it as the only
+  live packing; then refill the holes and search the next chunk of 8.
 
   g_open = all arrived items that are not yet packed in a *previous* container.
   A State's pending set is g_open minus whatever that State already packed.
   Packed items in the current box stay in g_open until the box is sealed.
 
   Per container loop:
-    1. force_room(12): keep the 12 smallest-min-edge SKUs as fillers; try to
-       pack the rest (FFD). Repeat until every beam state has pending <= 12,
-       then admit the next 10 onto g_open.
-    2. If that fails, force_room(0): pack anyone who still fits. If pending
-       is still > 12, seal the box. Leftover (unpacked members of g_open)
-       go to the next empty container. Packed placements stay in this box.
-    3. After each admit, tight-pack: place any pending item that sits in a
-       non-huge cavity with waste <= 2x item volume (fill slivers).
-    4. When the stream is exhausted, force_room(0) and seal.
+    1. Fill the buffer: while pending < 12 and the stream is not empty, take 1.
+    2. Beam-search up to CHUNK_K further placements from the current window.
+    3. Commit the best of those states (most items this chunk, then state_rank).
+    4. If the stream is exhausted: force_room(0) and seal.
+    5. If the chunk packed at least one item, go back to 1.
+    6. If nothing packed, seal. Leftover g_open items go to the next box.
 
   Items larger than the empty box are skipped. Nothing else is dropped.
 
@@ -105,9 +103,10 @@ static const int MAX_PLACED = 256;   // hard cap of items in one container
 static const int MAXEP = 640;        // EP list cap; extras are z-strided, not lowest-z only
 static const double TIME_LIMIT = 55.0;  // wall seconds per container, then expand stops
 static const double SUPPORT_RATIO = 0.60;
-static const int BATCH_SIZE = 10;    // conveyor batch; does not consume buffer slots
-static const int BUFFER_CAP = 12;    // max unpacked items that may be parked
-static const int OPEN_CAP = BUFFER_CAP + BATCH_SIZE;  // packable window
+static const int BUFFER_CAP = 12;    // max unpacked items
+static const int OPEN_CAP = BUFFER_CAP;
+static const int CHUNK_K = 8;        // beam-pack this many, commit best, refill
+int g_nthreads = 1;
 // 6 distinct axis-aligned orientations of (w,d,h).
 static const int ROT_PERM[6][3] = {
     {0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}
@@ -146,7 +145,6 @@ vector<int> min_edge;
 vector<int> g_open;           // arrived, not packed in a previous container
 int g_seen = 0;               // how far the arrival pointer has moved
 int g_typical_edge = 80;      // median min-edge of arrived items; cavity vs sliver
-int g_nthreads = 1;
 
 // Only items that have already arrived may influence "is this leftover cavity
 // still useful". Using the full stream would leak future SKU sizes.
@@ -617,9 +615,9 @@ struct Keep {
 };
 
 // Enumerate 6 rotations × all EPs, score legal poses, keep pos_keep best.
-// tight_only: only non-huge cavities with waste <= 2x item vol (post-admit
-// sliver fill). Otherwise, if any non-huge pose exists, drop huge ones so
-// small SKUs do not occupy a cavern meant for later larges.
+// tight_only: only non-huge cavities with waste <= 2x item vol (sliver fill
+// after topping up the buffer). Otherwise, if any non-huge pose exists, drop
+// huge ones so small SKUs do not occupy a cavern meant for later larges.
 void collect_placements(const State& u, int id, int pos_keep, vector<Keep>& tops, bool tight_only) {
     tops.clear();
     struct Row {
@@ -648,7 +646,7 @@ void collect_placements(const State& u, int id, int pos_keep, vector<Keep>& tops
     }
     if (rows.empty()) return;
     if (tight_only) {
-        // Post-admit sliver pass: ignore caverns and poses that leave >2x waste.
+        // Sliver pass: ignore caverns and poses that leave >2x waste.
         vector<Row> kept;
         for (const Row& row : rows) {
             if (!row.huge && row.waste <= 2LL * vol[id]) kept.push_back(row);
@@ -741,8 +739,9 @@ void expand_pending(const State& u, const vector<int>& ids, int pos_keep, vector
 
 // One successor generation from state `u`.
 //   time_up / already under max_pending / nothing to pack -> copy `u` through.
-//   tight_only: every pending SKU is a candidate (sliver fill after admit).
-//   else: FFD leave-set from must_leave_pending (pack larges, park fillers).
+//   tight_only: every pending SKU is a candidate (sliver fill).
+//   else: FFD leave-set from must_leave_pending (pack larges, park fillers);
+//         max_pending 0 / <0 tries every pending SKU.
 // If no legal pose exists, copy `u` unchanged so the beam does not die;
 // progress stays false and the outer loop can seal.
 void expand_state(const State& u, vector<State>& out, int pos_keep, int max_pending, bool tight_only,
@@ -773,7 +772,7 @@ void expand_state(const State& u, vector<State>& out, int pos_keep, int max_pend
 }
 
 // One beam layer: each live state tries to pack one more pending item.
-// max_pending >= 0 stops expanding once pending is small enough (admit).
+// max_pending >= 0 stops expanding once pending is small enough.
 // tight_only uses the sliver filter. States are independent; OpenMP splits
 // `cur` with per-thread candidate lists, then ranks and truncates to `beam`.
 bool buffer_round(vector<State>& cur, vector<State>& cand, vector<State>& nxt, int beam,
@@ -823,7 +822,7 @@ bool buffer_round(vector<State>& cur, vector<State>& cand, vector<State>& nxt, i
     return progress;
 }
 
-// True if any live beam state still has more unpacked items than the admit cap.
+// True if any live beam state still has more unpacked items than `max_pending`.
 bool any_pending_over(const vector<State>& cur, int max_pending) {
     for (const State& u : cur) {
         if (pending_count(u) > max_pending) return true;
@@ -964,6 +963,7 @@ int main(int argc, char** argv) {
     }
     omp_set_dynamic(0);
     omp_set_num_threads(g_nthreads);
+    cerr << fixed << setprecision(4);
     cerr << "threads " << g_nthreads << '\n';
 
     if (!(cin >> W >> D >> H)) return 0;
@@ -998,7 +998,7 @@ int main(int argc, char** argv) {
     };
 
     // One container: reset the 55s clock. Leftover from the previous box
-    // is already in g_open (buffer / unfinished conveyor).
+    // is already in g_open (buffer).
     while (next_item < N || !g_open.empty()) {
         t0 = chrono::steady_clock::now();
         skip_unfittable_open();
@@ -1007,6 +1007,22 @@ int main(int argc, char** argv) {
         vector<State> cur(1), nxt, cand;
         cand.reserve(beam * (size_t)OPEN_CAP * (size_t)pos_keep + 8);
         State best;
+
+        // True when some beam state already holds BUFFER_CAP unpacked items.
+        auto buffer_full = [&]() -> bool {
+            return any_pending_over(cur, BUFFER_CAP - 1);
+        };
+
+        // Pull one-at-a-time until the buffer is full or the stream ends.
+        auto fill_buffer = [&]() {
+            while (next_item < N && !buffer_full()) {
+                int id = next_item++;
+                g_seen = next_item;
+                if (item_fits_empty(id)) g_open.push_back(id);
+                else ++skipped;
+                update_typical_edge();  // cavity vs sliver uses arrived SKUs only
+            }
+        };
 
         // Pack until every beam member has pending <= max_pend (FFD if
         // max_pend > 0). False means some state is stuck above the cap.
@@ -1021,34 +1037,72 @@ int main(int argc, char** argv) {
         };
 
         while (true) {
-            int incoming = min(BATCH_SIZE, N - next_item);
-            if (incoming > 0) {
-                // Admit next conveyor batch only when unpacked count <= 12.
-                int need = BUFFER_CAP;
-                if (!force_room(need)) {
-                    force_room(0);  // squeeze fillers too
-                    if (any_pending_over(cur, need)) break;  // seal this box
-                }
-                for (int i = 0; i < incoming; ++i) {
-                    int id = next_item++;
-                    g_seen = next_item;
-                    if (item_fits_empty(id)) g_open.push_back(id);
-                    else ++skipped;
-                }
-                update_typical_edge();  // cavity vs sliver uses arrived SKUs only
-            }
+            int pending_before = cur.empty() ? 0 : pending_count(cur[0]);
+            int seen_before = g_seen;
+            fill_buffer();
+            int admitted = g_seen - seen_before;
+            int pending_now = cur.empty() ? (int)g_open.size() : pending_count(cur[0]);
 
-            // After a batch arrives, pack any pending SKU that fits a tight
-            // cavity (does not require FFD). Stops when nothing tight remains.
-            int guard = 0;
-            while (guard++ < 10000) {
-                if (!buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, true)) break;
-            }
-
-            if (incoming == 0) {
-                force_room(0);  // stream done: pack whatever still fits
+            if (next_item >= N) {
+                int guard = 0;
+                int extra = 0;
+                while (guard++ < 10000) {
+                    if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, true)) {
+                        ++extra;
+                        continue;
+                    }
+                    if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, false)) {
+                        ++extra;
+                        continue;
+                    }
+                    break;
+                }
+                force_room(0);
                 break;
             }
+
+            int n0 = 0;
+            for (const State& u : cur) n0 = max(n0, u.nplaced);
+            n0 = max(n0, best.nplaced);
+
+            int got = 0;
+            int guard = 0;
+            while (got < CHUNK_K && guard++ < 10000) {
+                if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, true)) {
+                    ++got;
+                    continue;
+                }
+                if (buffer_round(cur, cand, nxt, beam, pos_keep, best, -1, false)) {
+                    ++got;
+                    continue;
+                }
+                break;
+            }
+            if (got == 0) {
+                break;
+            }
+
+            int need = n0;
+            for (const State& u : cur) need = max(need, u.nplaced);
+            need = min(need, n0 + CHUNK_K);
+            const State* pick = nullptr;
+            long long pick_rank = 0;
+            for (const State& u : cur) {
+                if (u.nplaced < need) continue;
+                long long r = state_rank(u);
+                if (!pick || r > pick_rank || (r == pick_rank && better_state(u, *pick))) {
+                    pick = &u;
+                    pick_rank = r;
+                }
+            }
+            if (!pick) {
+                break;
+            }
+            State chosen = *pick;
+            cur.clear();
+            cur.push_back(chosen);
+            best = chosen;
+            double fill = box_vol ? 100.0 * chosen.g / box_vol : 0.0;
         }
         for (const State& u : cur) {
             if (better_state(u, best)) best = u;
