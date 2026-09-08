@@ -1,6 +1,6 @@
 # 三维装箱：生产窗口 + EMS/EP + 分层束搜索
 
-实现：`pack3d.cpp`。几何默认 **EMS 与 EP 同时维护**，Expand 时把两类落点取并；可用 `ems` / `ep` 只开一种。搜索用 **按已装件数分层的 beam**。  
+实现：`pack3d.cpp` + `rank.cpp`。几何默认 **EMS 与 EP 同时维护**，Expand 时把两类落点取并；可用 `ems` / `ep` 只开一种。搜索用 **按已装件数分层的 beam**。  
 不是离线全局排列：一次最多看见缓冲里 12 件未装箱。流水线一次来一件；对当前窗口搜「再装 8 件」的最好状态并落实，再补槽。目标是装填率（已装体积），件数只作并列打破。
 
 不维护高度图，不跑可采纳 A\*。
@@ -11,7 +11,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `pack3d.cpp` | 求解器 |
+| `pack3d.cpp` | 求解器（几何、窗口、束搜索） |
+| `pack_state.hpp` | 状态 / 全局量，给求解器和 rank 共用 |
+| `rank.hpp` / `rank.cpp` | `state_rank` + 28 维 `rank_features_vec` + 可选 JSONL dump |
+| `train_rank.py` | 读 dump 做条数/特征校验（训练脚本入口） |
 | `pack_viewer.html` | 三维查看器模板（占位 `__PACK_DATA__`） |
 | `input.txt` | 算例：`W D H` 后每行一件 `w d h` |
 | `快件高度 快件长度 快件宽度.txt` | 原始件尺寸（带表头） |
@@ -19,8 +22,10 @@
 编译与运行（必须带 `-fopenmp`；数字是线程数，默认 1；可选 `both` / `ems` / `ep`，默认两者都开）：
 
 ```
-g++ -O2 -std=c++17 -fopenmp -o pack3d pack3d.cpp
+g++ -O2 -std=c++17 -fopenmp -o pack3d pack3d.cpp rank.cpp
 ./pack3d 8 < input.txt > pack3d.out
+./pack3d 8 --rank-dump rank.jsonl < input.txt > pack3d.out
+python3 train_rank.py rank.jsonl
 ./pack3d 8 ep < input.txt > pack3d.out
 ./pack3d 8 ems < input.txt > pack3d.out
 ```
@@ -53,7 +58,7 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 流水线一次送来 1 件。缓冲最多 `BUFFER_CAP=12` 件未装箱，这也是可装窗口 `OPEN_CAP`。未装件数不会超过 12。  
 补满缓冲后，对当前 12 件做 `CHUNK_K=8` 层束搜索（每层再装 1 件）；在搜出的状态里落实估价最好的那一个，丢掉其余 beam 分支，再按空槽补满缓冲，进入下一轮。
 
-`g_typical_edge` = 已经到达件的 min-edge 中位数，至少 80。只用来判断空腔是「还能塞」还是死缝，**不看未来件**。
+`g_typical_edge` = 已经到达件的 min-edge 中位数，至少 80。搭桥最小支承宽度用它；**不看未来件**。
 
 每箱流程：
 
@@ -73,12 +78,14 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 
 ## 合法放置
 
-6 种旋转。位姿合法当且仅当：
+6 种旋转，但底面积小于最大面的 1/3 视为立不稳，该姿态不搜。位姿合法当且仅当：
 
 - 整件在箱内
 - 与已装件 AABB 不重叠
-- 底面支承面积 ≥ 底面积的 60%（`z=0` 视为地板）
-- 底面中心落在地板或某件顶面上（中心不能架在缝上）
+- 底面积 ≥ 最大面的 1/3（否则立不稳）
+- 底面支承（`z=0` 视为地板；否则只认共面顶 `p.z+p.h == z`，不同高度不搭）。满足其一即可：
+  - **坐实**：底面中心落在某一共面顶上，且重叠面积 ≥ 底面积的 60%
+  - **搭桥**：至少两块互不重合的支承矩形；跨度主轴为 X 或 Y，底面中心两侧都有支承，且每一侧沿跨度方向的宽度 ≥ `max(40, g_typical_edge / 4)` mm。中心可以在缝里，不再要求两侧面积之和 ≥ 60% 底面积。若中心的 X 落在支承缝里，只认 X 向桥（Y 向同理），避免长边刮擦被当成另一轴搭桥。
 
 ---
 
@@ -90,7 +97,7 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 
 落点不只钉左后下角：试该盒底面四个角（件贴齐后仍在盒内），以及底面 z 上已装件顶面与该盒的重叠角。极大空盒的最小角常常是悬空的（挡 `-z` 的货可能在底面另一侧）。件能放进去当且仅当三边都不超过该盒，再查支承。
 
-与 EP 同时开启时，这些角和 EP 点取并后，**残余一律从落点做 `residual_box`**，否则同一坐标会因「整块 EMS」和「局部残盒」两套尺子对不上。打分时，若姿态刚好把该残余填到箱盖，减掉一块与「典型件高度 × 底面积」同量级的分，避免贴合高柱顶死。
+与 EP 同时开启时，这些角和 EP 点取并后，**残余一律从落点做 `residual_box`**，否则同一坐标会因「整块 EMS」和「局部残盒」两套尺子对不上。
 
 **EP（`ep`）**：
 
@@ -107,34 +114,35 @@ stderr：每箱的取件 / 每层搜索 / 落实状态，以及最后一行汇�
 
 ## 分数（不要混用）
 
-**落点分** `place_score` —— 只比较同一件的不同候选 / 旋转：
+当前 `state_rank` 在 `rank.cpp`：体积仍压过几何，同 \(g\) 的姿态用 compactness / 末件接触 / 空腔 / 末件残腔 / 窗口大件搁浅来拆开。`better_state` 仍只比装填率。
 
-```
-巨大空腔:  vol + contact/3 − lid
-否则:      vol/10 − cavity_waste − 80·height_mismatch + contact/3 − lid
-```
+同一件的合法姿态不再单独打分：每个 `(SKU, 旋转, 落点)` 都生成后继，由 `state_rank` 在整层 `cand` 里截断。
 
-- `contact`：与箱壁、已装件共面的接触面积
-- `cavity_waste`：残余盒体积 − 件体积
-- `height_mismatch`：与 xy 间隙 ≤ 40 的邻件比顶面高度差；没有邻居则 0
-- `lid`：姿态把当前残余高度恰好填到 `H` 时为 `3·w·d·max(typical_edge, 180)`，否则 0
-
-tight 模式另外丢掉巨大空腔，以及浪费 > 2× 件体积的姿态。  
-非 tight：只要存在非巨大姿态，就丢掉巨大姿态（小件不要去占给后面大件留的洞）。
+tight 模式丢掉巨大空腔，以及浪费 > 2× 件体积的姿态。  
+非 tight：只要存在非巨大姿态，就丢掉巨大姿态。
 
 **状态分** `state_rank` —— 层内排序：
 
-```
-rank = g·10000 − compactness·20 + cavity_tiebreak
-```
+`rank_features_vec(st)` → 28 维无量纲 `phi[]`（训练 / 推理用）。`state_rank` 仍用手调线性，热路径不依赖 vec。
 
-- `compactness`：各件最小角之和 + 包围盒底面积/8 + 最高 z + 3·|EPs|（同等体积偏好更挤向原点）
-- `cavity_tiebreak`：开着 EMS 时用各空盒（不和 EP 残腔相加，量纲不同且 EMS 已重叠）。仅 EP 时用各点上的残余盒。最短边 ≥ `g_typical_edge` 的算可用
+**28 维 `phi`（顺序固定，见 `rank_feature_name(i)`）**
+
+| # | 名 | 含义 |
+|---|---|---|
+| 0–1 | fill, nplaced | 装填率、件数 |
+| 2–8 | floor_cover … maxy_d | 地板覆盖、包络 |
+| 9–10 | wall_contact, item_contact | 整箱墙/货接触 |
+| 11–12 | nems, nep | 空腔点数 |
+| 13–18 | max_cav_* … max_cav_h | EMS/EP 空腔体积与最大盒三边 |
+| 19–22 | pending_* , unplaceable | 窗口 pending 与搁浅 |
+| 23–27 | compactness, last_* | 紧凑度、末件姿态 |
+
+**JSONL dump**（`--rank-dump rank.jsonl` 或 `PACK3D_RANK_DUMP`）
+
+- `type=cand`：每层每个候选（最多 4096/层），含 `phi`, `rank`, `kept`, `g`, `nplaced`, `bin`, `layer`
+- `type=pair`：同 `(g,nplaced)` 下 kept 最高 vs 未 kept 最高（最多 512/层，成对训练用）
 
 **报优 / 装填率** `better_state`：先比 `g`，再比件数。
-
-**大件搁浅惩罚**（只加在 `select_top` 的前 `max(beam, 3·beam)` 个上）：  
-看 pending 里体积最大的 4 件，当前候选上已完全放不下的体积 × 20000 从 rank 里减掉。略空一点但还能放大件的布局，优于把大件卡死的贪心填满。
 
 ---
 
@@ -148,15 +156,16 @@ buffer_round(cur, tight_only):
     有任一状态真正多装了一件则 progress=true
 ```
 
-`Expand` 一次只多装 **一件**（每个候选 SKU 独立试 `pos_keep` 个姿态）。  
+`Expand` 一次只多装 **一件**（每个候选 SKU 的全部合法姿态都打分）。  
+每个 `(SKU, 旋转, 落点)` 都打分。两遍：第一遍堆留 top-`beam` 分得阈值；第二遍只物化 `rank >= 阈值` 的状态。  
+单个父状态内：合法落点先收齐，再对落点列表并行 `score_pose`（外层已在 parallel 里时用 task，否则 parallel for）。  
 pending 为空、超时或没有合法姿态：原样留下，progress 为假，外层可以封箱。
 
 `select_top`：
 
 1. 按 `state_rank` 排序
-2. 对头部 pool 再减大件搁浅惩罚，重排
-3. `geom_sig` 去重（已装 id + 前几个空腔；不同放置顺序走到同一几何只留一份）
-4. 按 `|geom|/6` 分桶，每桶约 `beam/8`，溢出按名次补满 `beam`
+2. `geom_sig` 去重（已装 id + 前几个空腔；不同放置顺序走到同一几何只留一份）
+3. 按 `|geom|/6` 分桶，每桶约 `beam/8`，溢出按名次补满 `beam`
 
 层与层、箱与箱串行（下一箱依赖剩件）。
 
@@ -166,12 +175,11 @@ pending 为空、超时或没有合法姿态：原样留下，progress 为假，
 
 ```
 beam          480     每层活状态
-pos_keep      3       同一 (状态, SKU) 保留的姿态数
 TIME_LIMIT    90s     每箱墙钟
 MAXEP         640     EP 点数上限
 MAXEMS        1280    EMS 空盒上限
 MAX_PLACED    256     单箱件数硬顶
-SUPPORT_RATIO 0.60
+SUPPORT_RATIO 0.60    坐实路径重叠面积门槛（搭桥不走这条）
 BUFFER_CAP    12      未装件数上限
 OPEN_CAP      12      可装窗口 = 缓冲
 CHUNK_K       8       每轮从窗口搜这么多层，落实最好状态后再补槽
@@ -193,9 +201,10 @@ CHUNK_K       8       每轮从窗口搜这么多层，落实最好状态后再�
     └─ 本轮装不动（或流尽）→ 封箱，剩件进下一箱
             │
             每层：pending SKU × 旋转 × (EMS角 ∪ EP)
-                  Feasible → residual_box → place_score 留 pos_keep
-                  UpdateEMS 且/或 UpdateEPs
-                  state_rank + 大件惩罚 + 去重分桶
+                  Feasible → residual_box（tight / 巨大腔过滤）
+                  第一遍：score → 堆留 top beam 分 → 阈值
+                  第二遍：score → rank>=阈值 才物化 State
+                  select_top → 留下 beam
             （先 tight，没有再用任意姿态）
 ```
 
